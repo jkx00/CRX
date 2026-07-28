@@ -28,7 +28,7 @@ crx -d target_domain
 ## Install
 
 ```bash
-cd ~/Downloads/craxify
+cd ~/Downloads/CRX
 bash install.sh
 ```
 
