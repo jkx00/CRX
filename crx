@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+#
+#   ██████╗██████╗ ██╗  ██╗
+#  ██╔════╝██╔══██╗╚██╗██╔╝
+#  ██║     ██████╔╝ ╚███╔╝
+#  ██║     ██╔══██╗ ██╔██╗
+#  ╚██████╗██║  ██║██╔╝ ██╗
+#   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝
+#
+#  crx - automated recon pipeline (craxify-style)
+#  Usage: crx -d target_domain
+#
+#  Pipeline: subfinder -> httpx -> dnsx -> cdncheck -> whatweb
+#            -> URL collection (waybackurls/gau/katana/hakrawler/urlfinder)
+#            -> dedupe (uro/urless/urldedupe) -> sensitive files -> JS
+#            -> subzy (takeover) -> corsy (CORS) -> nuclei -> open redirect
+#
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+    R='\033[1;31m'; G='\033[1;32m'; Y='\033[1;33m'; B='\033[1;34m'
+    C='\033[1;36m'; W='\033[1;37m'; D='\033[0;90m'; N='\033[0m'
+else
+    R=''; G=''; Y=''; B=''; C=''; W=''; D=''; N=''
+fi
+
+banner() {
+cat <<EOF
+${C}
+   ██████╗██████╗ ██╗  ██╗
+  ██╔════╝██╔══██╗╚██╗██╔╝
+  ██║     ██████╔╝ ╚███╔╝
+  ██║     ██╔══██╗ ██╔██╗
+  ╚██████╗██║  ██║██╔╝ ██╗
+   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝${N}
+  ${D}automated recon pipeline${N}
+
+╔════════════════════════════════════════════════════════════════════╗
+║                 CRX Framework • Automated Recon       
+╠════════════════════════════════════════════════════════════════════╣
+║  👤 Author    : JK (Jeyakumar S)                                   ║
+║  🔗 LinkedIn  : https://www.linkedin.com/in/jeyakumar-s-255b03333/ ║
+║  🚀 Version   : v1.0.0                                             ║
+╚════════════════════════════════════════════════════════════════════╝
+EOF
+}
+
+log()   { echo -e "${B}[*]${N} $*"; }
+ok()    { echo -e "${G}[+]${N} $*"; }
+warn()  { echo -e "${Y}[!]${N} $*"; }
+err()   { echo -e "${R}[-]${N} $*" >&2; }
+stage() { echo -e "\n${W}==>${N} ${C}$*${N}"; }
+
+usage() {
+    banner
+    cat <<EOF
+
+  ${W}Usage:${N} crx -d <target_domain> [options]
+
+  ${W}Options:${N}
+    -d <domain>   Target domain (required)          e.g. crx -d example.com
+    -o <dir>      Output directory (default: ./<domain>-crx)
+    -t <int>      Thread/concurrency hint (default: 50)
+    -h            Show this help
+    -c            Contact / about
+
+  ${W}Example:${N}
+    crx -d vulnweb.com
+EOF
+    exit 0
+}
+
+contact() {
+    banner
+    echo -e "\n  ${W}crx${N} - craxify-style recon wrapper"
+    echo -e "  Reference: https://github.com/vulncrax/craxify"
+    echo -e "  Runs local tools only. Use on assets you are authorised to test.\n"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Arg parsing
+# ---------------------------------------------------------------------------
+DOMAIN=""; OUTDIR=""; THREADS=50
+while getopts ":d:o:t:hc" opt; do
+    case "$opt" in
+        d) DOMAIN="$OPTARG" ;;
+        o) OUTDIR="$OPTARG" ;;
+        t) THREADS="$OPTARG" ;;
+        h) usage ;;
+        c) contact ;;
+        :) err "Option -$OPTARG requires an argument."; exit 1 ;;
+        \?) err "Unknown option -$OPTARG"; exit 1 ;;
+    esac
+done
+
+[ -z "$DOMAIN" ] && { usage; }
+
+# strip scheme/trailing slash if pasted as URL
+DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"
+[ -z "$OUTDIR" ] && OUTDIR="$(pwd)/${DOMAIN}-crx"
+
+# ---------------------------------------------------------------------------
+# Tool presence check (warn, don't hard-fail; stages skip if missing)
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+REQUIRED=(subfinder httpx dnsx cdncheck whatweb waybackurls gau katana \
+          hakrawler urlfinder uro urless urldedupe subzy corsy nuclei)
+missing=()
+for t in "${REQUIRED[@]}"; do have "$t" || missing+=("$t"); done
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+banner
+echo
+log "Target      : ${W}${DOMAIN}${N}"
+log "Output dir  : ${W}${OUTDIR}${N}"
+log "Started     : $(date '+%Y-%m-%d %H:%M:%S')"
+if [ ${#missing[@]} -gt 0 ]; then
+    warn "Missing tools (their stages will be skipped): ${missing[*]}"
+    warn "Install them with: bash install.sh"
+fi
+
+mkdir -p "$OUTDIR"/{subs,urls,vulns}
+SUBS="$OUTDIR/subs/subdomains.txt"
+LIVE="$OUTDIR/subs/live.txt"
+IPS="$OUTDIR/subs/resolved.txt"
+ALLURLS="$OUTDIR/urls/all-urls.txt"
+CLEAN="$OUTDIR/urls/clean-urls.txt"
+
+# ---------------------------------------------------------------------------
+# 1. Subdomain enumeration
+# ---------------------------------------------------------------------------
+stage "[1/11] Subdomain enumeration (subfinder)"
+if have subfinder; then
+    subfinder -d "$DOMAIN" -all -silent 2>/dev/null | sort -u > "$SUBS"
+    # always include the apex
+    echo "$DOMAIN" >> "$SUBS"; sort -u -o "$SUBS" "$SUBS"
+    ok "Found $(wc -l < "$SUBS") subdomains -> $SUBS"
+else
+    warn "subfinder missing; seeding with apex domain only"
+    echo "$DOMAIN" > "$SUBS"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Live host filtering (httpx)
+# ---------------------------------------------------------------------------
+stage "[2/11] Live host probing (httpx)"
+if have httpx; then
+    httpx -l "$SUBS" -silent -threads "$THREADS" \
+          -status-code -title -tech-detect -no-color 2>/dev/null \
+          > "$OUTDIR/subs/httpx-detailed.txt"
+    awk '{print $1}' "$OUTDIR/subs/httpx-detailed.txt" | sort -u > "$LIVE"
+    ok "Live hosts: $(wc -l < "$LIVE") -> $LIVE"
+else
+    warn "httpx missing; using raw subdomain list as live hosts"
+    sed 's#^#https://#' "$SUBS" > "$LIVE"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. DNS resolution (dnsx)
+# ---------------------------------------------------------------------------
+stage "[3/11] DNS resolution (dnsx)"
+if have dnsx; then
+    dnsx -l "$SUBS" -silent -a -resp -o "$IPS" 2>/dev/null
+    ok "Resolved records -> $IPS"
+else
+    warn "dnsx missing; skipping resolution"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. CDN / WAF check (cdncheck)
+# ---------------------------------------------------------------------------
+stage "[4/11] CDN / WAF fingerprint (cdncheck)"
+if have cdncheck && [ -s "$IPS" ]; then
+    awk '{print $NF}' "$IPS" | tr -d '[]' | sort -u \
+        | cdncheck -silent -resp 2>/dev/null > "$OUTDIR/subs/cdn.txt"
+    ok "CDN results -> $OUTDIR/subs/cdn.txt"
+else
+    warn "cdncheck missing or no IPs; skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Technology fingerprint (whatweb)
+# ---------------------------------------------------------------------------
+stage "[5/11] Technology fingerprint (whatweb)"
+if have whatweb && [ -s "$LIVE" ]; then
+    whatweb -i "$LIVE" --no-errors --log-brief="$OUTDIR/subs/whatweb.txt" \
+            >/dev/null 2>&1
+    ok "WhatWeb results -> $OUTDIR/subs/whatweb.txt"
+else
+    warn "whatweb missing or no live hosts; skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. URL collection (waybackurls, gau, katana, hakrawler, urlfinder)
+# ---------------------------------------------------------------------------
+stage "[6/11] URL collection (wayback/gau/katana/hakrawler/urlfinder)"
+: > "$ALLURLS"
+if have waybackurls; then echo "$DOMAIN" | waybackurls 2>/dev/null >> "$ALLURLS"; ok "waybackurls done"; fi
+if have gau;         then echo "$DOMAIN" | gau --threads "$THREADS" 2>/dev/null >> "$ALLURLS"; ok "gau done"; fi
+if have urlfinder;   then urlfinder -d "$DOMAIN" -silent 2>/dev/null >> "$ALLURLS"; ok "urlfinder done"; fi
+if have katana && [ -s "$LIVE" ]; then
+    katana -list "$LIVE" -silent -jc -d 3 -c "$THREADS" 2>/dev/null >> "$ALLURLS"; ok "katana done"
+fi
+if have hakrawler && [ -s "$LIVE" ]; then
+    cat "$LIVE" | hakrawler -d 3 -u 2>/dev/null >> "$ALLURLS"; ok "hakrawler done"
+fi
+sort -u -o "$ALLURLS" "$ALLURLS"
+ok "Raw URLs collected: $(wc -l < "$ALLURLS") -> $ALLURLS"
+
+# ---------------------------------------------------------------------------
+# 7. Deduplicate / normalise (uro -> urless -> urldedupe)
+# ---------------------------------------------------------------------------
+stage "[7/11] Deduplicate & normalise (uro / urless / urldedupe)"
+cp "$ALLURLS" "$CLEAN"
+if have uro;       then uro -i "$CLEAN" -o "$CLEAN.tmp" 2>/dev/null && mv "$CLEAN.tmp" "$CLEAN"; ok "uro applied"; fi
+if have urless;    then urless -i "$CLEAN" 2>/dev/null | sort -u > "$CLEAN.tmp" && mv "$CLEAN.tmp" "$CLEAN"; ok "urless applied"; fi
+if have urldedupe; then urldedupe -s < "$CLEAN" 2>/dev/null | sort -u > "$CLEAN.tmp" && mv "$CLEAN.tmp" "$CLEAN"; ok "urldedupe applied"; fi
+ok "Clean URLs: $(wc -l < "$CLEAN") -> $CLEAN"
+
+# ---------------------------------------------------------------------------
+# 8. Interesting extraction (sensitive files + JS + params)
+# ---------------------------------------------------------------------------
+stage "[8/11] Extract sensitive files, JS & parameterised URLs"
+grep -Ei '\.(json|db|config|txt|log|cache|secret|backup|yml|yaml|gz|rar|zip|bak|old|sql|env)(\?|$)' \
+    "$CLEAN" | sort -u > "$OUTDIR/urls/sensitive-files.txt"
+grep -Ei '\.js(\?|$)' "$CLEAN" | sort -u > "$OUTDIR/urls/js-files.txt"
+grep -F '?' "$CLEAN" | sort -u > "$OUTDIR/urls/params.txt"
+ok "Sensitive: $(wc -l < "$OUTDIR/urls/sensitive-files.txt")  |  JS: $(wc -l < "$OUTDIR/urls/js-files.txt")  |  Param URLs: $(wc -l < "$OUTDIR/urls/params.txt")"
+
+# ---------------------------------------------------------------------------
+# 9. Subdomain takeover (subzy)
+# ---------------------------------------------------------------------------
+stage "[9/11] Subdomain takeover (subzy)"
+if have subzy && [ -s "$SUBS" ]; then
+    subzy run --targets "$SUBS" --concurrency "$THREADS" --hide_fails \
+        2>/dev/null | tee "$OUTDIR/vulns/takeover.txt" >/dev/null
+    ok "Takeover scan -> $OUTDIR/vulns/takeover.txt"
+else
+    warn "subzy missing; skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. CORS misconfiguration (corsy)
+# ---------------------------------------------------------------------------
+stage "[10/11] CORS misconfiguration (corsy)"
+if have corsy && [ -s "$LIVE" ]; then
+    corsy -i "$LIVE" -t "$THREADS" -o "$OUTDIR/vulns/cors.json" >/dev/null 2>&1
+    ok "CORS scan -> $OUTDIR/vulns/cors.json"
+else
+    warn "corsy missing or no live hosts; skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Vulnerability scan (nuclei) + open redirect
+# ---------------------------------------------------------------------------
+stage "[11/11] Vulnerability scan (nuclei) + open-redirect"
+if have nuclei && [ -s "$LIVE" ]; then
+    nuclei -l "$LIVE" -silent \
+           -severity low,medium,high,critical \
+           -o "$OUTDIR/vulns/nuclei.txt" 2>/dev/null
+    ok "nuclei findings -> $OUTDIR/vulns/nuclei.txt"
+
+    # open redirect: feed parameterised URLs to nuclei redirect templates
+    if [ -s "$OUTDIR/urls/params.txt" ]; then
+        nuclei -l "$OUTDIR/urls/params.txt" -silent \
+               -tags redirect \
+               -o "$OUTDIR/vulns/open-redirect.txt" 2>/dev/null
+        ok "open-redirect -> $OUTDIR/vulns/open-redirect.txt"
+    fi
+else
+    warn "nuclei missing or no live hosts; skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+stage "Done"
+ok "Finished     : $(date '+%Y-%m-%d %H:%M:%S')"
+ok "Results tree : ${W}${OUTDIR}${N}"
+echo -e "${D}"
+find "$OUTDIR" -type f -printf '   %p (%s bytes)\n' 2>/dev/null | sort
+echo -e "${N}"
