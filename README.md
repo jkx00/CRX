@@ -1,7 +1,7 @@
 # crx
 
 Automated reconnaissance pipeline for bug bounty / authorised pentesting,
-modelled on [vulncrax/craxify](https://github.com/vulncrax/craxify).
+modelled on [jkx00/CRX](https://github.com/jkx00/CRX.git).
 
 Wraps 16 tools into a single command:
 
